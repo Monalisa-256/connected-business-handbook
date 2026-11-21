@@ -1,0 +1,275 @@
+name: Import handbook ZIP
+
+# Upload a complete handbook archive at handbook-update.zip.
+# This workflow imports its Markdown files at the repo root, removes obsolete
+# previously managed chapters, updates FILE-INVENTORY.md, and deletes the ZIP.
+# The workflow itself is NEVER read from or replaced by the archive.
+on:
+  push:
+    paths:
+      - 'handbook-update.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: handbook-import-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  import:
+    name: Validate, synchronize and verify handbook
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Validate ZIP and synchronize Markdown files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from collections import defaultdict
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import unquote
+          import hashlib
+          import os
+          import re
+          import stat
+          import sys
+          import unicodedata
+          import zipfile
+          
+          root = Path.cwd().resolve()
+          archive = root / 'handbook-update.zip'
+          inventory = root / 'FILE-INVENTORY.md'
+          signature = '<!-- handbook-import: managed-files; generated automatically -->'
+          max_files = 1000
+          max_file_bytes = 5 * 1024 * 1024
+          max_total_bytes = 50 * 1024 * 1024
+          
+          if archive.is_symlink():
+              raise ValueError('The uploaded ZIP must be a regular file, not a symlink.')
+          if inventory.is_symlink():
+              raise ValueError('FILE-INVENTORY.md must be a regular Markdown file.')
+          if not archive.is_file():
+              if os.environ.get('EVENT_NAME') == 'workflow_dispatch':
+                  sys.exit('Missing handbook-update.zip. Upload the ZIP first.')
+              print('Nothing to import (the ZIP was already removed).')
+              sys.exit(0)
+          
+          def clean_path(name):
+              if not name or '\\' in name or name.startswith('/') or '\x00' in name:
+                  raise ValueError(f'Unsafe ZIP path: {name!r}')
+              if unicodedata.normalize('NFC', name) != name:
+                  raise ValueError(f'Non-normalized ZIP path: {name!r}')
+              parts = name.split('/')
+              if any(p in ('', '.', '..') for p in parts):
+                  raise ValueError(f'Unsafe ZIP path: {name!r}')
+              if any(p.startswith('.') for p in parts):
+                  raise ValueError(f'Hidden or protected ZIP path: {name!r}')
+              if len(name) > 240:
+                  raise ValueError(f'ZIP path exceeds 240 characters: {name!r}')
+              return PurePosixPath(name)
+          
+          files = []
+          with zipfile.ZipFile(archive) as zipped:
+              entries = [item for item in zipped.infolist() if not item.is_dir()]
+              if len(entries) > max_files + 1:
+                  raise ValueError('Too many ZIP files (maximum 1000 Markdown files).')
+              total = 0
+              for item in entries:
+                  name = item.filename
+                  # Finder and Windows archive metadata is not handbook content.
+                  if name.startswith('__MACOSX/') or name.endswith('/.DS_Store') or name in ('.DS_Store', 'Thumbs.db'):
+                      continue
+                  path = clean_path(name)
+                  if path.suffix.lower() != '.md':
+                      raise ValueError(f'Only Markdown is allowed in the ZIP: {name}')
+                  file_type = stat.S_IFMT(item.external_attr >> 16)
+                  if file_type not in (0, stat.S_IFREG):
+                      raise ValueError(f'ZIP entry is not a normal file: {name}')
+                  if item.file_size > max_file_bytes:
+                      raise ValueError(f'File is over 5 MB: {name}')
+                  total += item.file_size
+                  if total > max_total_bytes:
+                      raise ValueError('Total extracted size is over 50 MB.')
+                  data = zipped.read(item)
+                  if len(data) != item.file_size:
+                      raise ValueError(f'Unexpected extracted size: {name}')
+                  if b'\x00' in data:
+                      raise ValueError(f'Non-text content: {name}')
+                  data.decode('utf-8')
+                  files.append((path, data))
+          
+          if not files:
+              raise ValueError('ZIP contains no Markdown files.')
+          
+          # Accept either root-level files, or exactly one enclosing folder.
+          parts = [path.parts for path, _ in files]
+          if all(len(p) >= 2 for p in parts) and len({p[0] for p in parts}) == 1:
+              wrapper = parts[0][0]
+              files = [(PurePosixPath(*path.parts[1:]), data) for path, data in files]
+              print(f'Removed one enclosing ZIP folder: {wrapper}/')
+          
+          incoming = {}
+          seen_lower = {}
+          hashes = {}
+          for path, data in files:
+              clean_path(path.as_posix())
+              name = path.as_posix()
+              if name.casefold() in seen_lower:
+                  raise ValueError(f'Duplicate or case-conflicting ZIP path: {name} / {seen_lower[name.casefold()]}')
+              seen_lower[name.casefold()] = name
+              if name == 'FILE-INVENTORY.md':
+                  # The inventory is always regenerated from the actual files.
+                  continue
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise ValueError(f'Duplicate Markdown content: {name} / {hashes[digest]}')
+              hashes[digest] = name
+              incoming[name] = data
+          
+          if 'README.md' not in incoming:
+              raise ValueError('README.md must be at the archive root (no nested repository wrapper).')
+          
+          # Check that links target files that will actually be in the repo.
+          link_pattern = re.compile(r'(?<!!)\[[^\]\n]*\]\(([^)\n]+)\)')
+          for name, data in incoming.items():
+              body = data.decode('utf-8')
+              if sum(line.lstrip().startswith('```') for line in body.splitlines()) % 2:
+                  raise ValueError(f'Unclosed Markdown code fence in {name}')
+              for match in link_pattern.finditer(body):
+                  target = match.group(1).strip().split(' ', 1)[0].strip('<>')
+                  if not target or target.startswith(('#', '/', 'mailto:', 'tel:')) or '://' in target:
+                      continue
+                  target = unquote(target).split('#', 1)[0].split('?', 1)[0]
+                  if not target:
+                      continue
+                  joined = PurePosixPath(name).parent.joinpath(target)
+                  normalized = os.path.normpath(joined.as_posix()).replace('\\', '/')
+                  if normalized.endswith('/'):
+                      normalized += 'README.md'
+                  if normalized not in incoming and normalized != 'FILE-INVENTORY.md':
+                      raise ValueError(f'Broken Markdown link: {name} -> {target} (resolved: {normalized})')
+          
+          def safe_repo_file(relative_name):
+              name = clean_path(relative_name).as_posix()
+              if not name.endswith('.md') or name == 'FILE-INVENTORY.md':
+                  raise ValueError(f'Invalid managed path: {name}')
+              path = root / name
+              for parent in (path, *path.parents):
+                  if parent == root:
+                      break
+                  if parent.is_symlink():
+                      raise ValueError(f'Symlink in managed path: {name}')
+              return path
+          
+          previous = set()
+          if inventory.exists():
+              existing = inventory.read_text(encoding='utf-8')
+              if signature not in existing:
+                  raise ValueError('FILE-INVENTORY.md is not a valid generated inventory.')
+              for line in existing.splitlines():
+                  match = re.fullmatch(r'- `([^`]+\.md)`', line)
+                  if match:
+                      safe_repo_file(match.group(1))
+                      previous.add(match.group(1))
+          else:
+              # One-time migration from the older handbook without an inventory.
+              legacy_folders = [
+                  '00-start-here', '01-foundations', '02-models', '03-connections',
+                  '04-no-code', '05-playbooks', '06-management', '07-templates',
+                  '08-deep-dives', '09-case-studies', '10-diagram-atlas',
+                  '11-workbooks', 'reference',
+              ]
+              for folder in legacy_folders:
+                  if (root / folder).is_dir():
+                      for file in (root / folder).rglob('*.md'):
+                          if not file.is_symlink():
+                              previous.add(file.relative_to(root).as_posix())
+              for filename in (
+                  'README.md', 'CHANGELOG.md', 'CONTRIBUTING.md',
+                  'EDITORIAL-STANDARDS.md', 'PUBLICATION-CHECKLIST.md',
+                  'IMPORTING-UPDATES.md',
+              ):
+                  if (root / filename).is_file():
+                      previous.add(filename)
+          
+          # Refuse file/directory conflicts before deleting or writing anything.
+          for name in incoming:
+              path = safe_repo_file(name)
+              if path.exists() and not path.is_file():
+                  raise ValueError(f'Existing path is not a regular file: {name}')
+              for parent in path.parents:
+                  if parent == root:
+                      break
+                  if parent.exists() and not parent.is_dir():
+                      raise ValueError(f'Existing parent is not a directory: {name}')
+
+          # Validation is complete: start changing the working tree.
+          obsolete = previous - incoming.keys()
+          for name in sorted(obsolete):
+              path = safe_repo_file(name)
+              if path.is_file():
+                  path.unlink()
+                  print(f'Removed obsolete chapter: {name}')
+          for name, data in sorted(incoming.items()):
+              path = safe_repo_file(name)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if not path.exists() or path.read_bytes() != data:
+                  path.write_bytes(data)
+          
+          paths = sorted(incoming, key=str.casefold)
+          inventory.write_text(
+              '# Managed handbook files\n\n'
+              + signature + '\n\n'
+              + 'This index is maintained automatically by the import workflow. '
+                'Do not edit it by hand. Only the listed Markdown files are '
+                'replaced or removed during future imports.\n\n'
+              + '\n'.join(f'- `{name}`' for name in paths) + '\n',
+              encoding='utf-8',
+          )
+          
+          # Remove empty obsolete subject folders, but never unrelated content.
+          directories = sorted(
+              {root / part for name in obsolete for part in [str(PurePosixPath(name).parent)] if part != '.'},
+              key=lambda p: len(p.parts),
+              reverse=True,
+          )
+          for directory in directories:
+              while directory != root and directory.is_dir():
+                  try:
+                      directory.rmdir()
+                  except OSError:
+                      break
+                  directory = directory.parent
+          archive.unlink()
+          print(f'Imported {len(incoming)} Markdown files; removed {len(obsolete)} obsolete paths.')
+          print('Validated README, file uniqueness, Markdown fences and local links.')
+          PY
+
+      - name: Commit handbook changes and discard uploaded ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'All handbook files already match the uploaded ZIP.'
+          else
+            git commit -m 'docs: synchronize handbook from uploaded ZIP'
+            case "$GITHUB_REF" in
+              refs/heads/*) git push origin "HEAD:$GITHUB_REF" ;;
+              *) echo 'Import requires a branch ref.' >&2; exit 1 ;;
+            esac
+          fi
